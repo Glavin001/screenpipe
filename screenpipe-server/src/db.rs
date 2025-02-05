@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use image::DynamicImage;
 use libsqlite3_sys::sqlite3_auto_extension;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, warn, info};
 use screenpipe_core::{AudioDevice, AudioDeviceType};
 use screenpipe_vision::OcrEngine;
 use sqlite_vec::sqlite3_vec_init;
@@ -469,6 +469,8 @@ impl DatabaseManager {
         frame_name: Option<&str>,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         let mut results = Vec::new();
+
+        info!("searching with content type: {:?}", content_type);
 
         match content_type {
             ContentType::All => {
@@ -1521,6 +1523,9 @@ impl DatabaseManager {
         limit: u32,
         offset: u32,
     ) -> Result<Vec<UiContent>, sqlx::Error> {
+
+        info!("search_ui_monitoring start");
+
         let base_sql = if query.is_empty() {
             "ui_monitoring"
         } else {
@@ -1532,6 +1537,35 @@ impl DatabaseManager {
         } else {
             "WHERE ui_monitoring_fts MATCH ?1"
         };
+
+        // let sql = format!(
+        //     r#"
+        //     SELECT
+        //         ui_monitoring.id,
+        //         ui_monitoring.text_output,
+        //         ui_monitoring.timestamp,
+        //         ui_monitoring.app,
+        //         ui_monitoring.window,
+        //         ui_monitoring.initial_traversal_at,
+        //         video_chunks.file_path,
+        //         frames.offset_index
+        //     FROM {}
+        //     LEFT JOIN frames ON
+        //         frames.timestamp BETWEEN
+        //             datetime(ui_monitoring.timestamp, '-1 seconds')
+        //             AND datetime(ui_monitoring.timestamp, '+1 seconds')
+        //     LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
+        //     {}
+        //         AND (?2 IS NULL OR ui_monitoring.timestamp >= ?2)
+        //         AND (?3 IS NULL OR ui_monitoring.timestamp <= ?3)
+        //         AND (?4 IS NULL OR ui_monitoring.app LIKE '%' || ?4 || '%')
+        //         AND (?5 IS NULL OR ui_monitoring.window LIKE '%' || ?5 || '%')
+        //     ORDER BY ui_monitoring.timestamp DESC
+        //     LIMIT ?7 OFFSET ?8
+        //     "#,
+        //     base_sql, where_clause
+        // );
+
 
         let sql = format!(
             r#"
@@ -1550,16 +1584,55 @@ impl DatabaseManager {
                     datetime(ui_monitoring.timestamp, '-1 seconds')
                     AND datetime(ui_monitoring.timestamp, '+1 seconds')
             LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
-            {}
-                AND (?2 IS NULL OR ui_monitoring.timestamp >= ?2)
-                AND (?3 IS NULL OR ui_monitoring.timestamp <= ?3)
-                AND (?4 IS NULL OR ui_monitoring.app LIKE '%' || ?4 || '%')
-                AND (?5 IS NULL OR ui_monitoring.window LIKE '%' || ?5 || '%')
+                {}
             ORDER BY ui_monitoring.timestamp DESC
             LIMIT ?7 OFFSET ?8
             "#,
             base_sql, where_clause
         );
+
+        // Construct the SQL with parameters inlined
+        // let inlined_sql = format!(
+        //     r#"
+        //     SELECT
+        //         ui_monitoring.id,
+        //         ui_monitoring.text_output,
+        //         ui_monitoring.timestamp,
+        //         ui_monitoring.app,
+        //         ui_monitoring.window,
+        //         ui_monitoring.initial_traversal_at,
+        //         video_chunks.file_path,
+        //         frames.offset_index
+        //     FROM {}
+        //     LEFT JOIN frames ON
+        //         frames.timestamp BETWEEN
+        //             datetime(ui_monitoring.timestamp, '-1 seconds')
+        //             AND datetime(ui_monitoring.timestamp, '+1 seconds')
+        //     LEFT JOIN video_chunks ON frames.video_chunk_id = video_chunks.id
+        //     {}
+        //         AND ({:?} IS NULL OR ui_monitoring.timestamp >= {:?})
+        //         AND ({:?} IS NULL OR ui_monitoring.timestamp <= {:?})
+        //         AND ({:?} IS NULL OR ui_monitoring.app LIKE '%' || {:?} || '%')
+        //         AND ({:?} IS NULL OR ui_monitoring.window LIKE '%' || {:?} || '%')
+        //     ORDER BY ui_monitoring.timestamp DESC
+        //     LIMIT {} OFFSET {}
+        //     "#,
+        //     base_sql,
+        //     where_clause,
+        //     start_time,
+        //     start_time,
+        //     end_time,
+        //     end_time,
+        //     app_name,
+        //     app_name,
+        //     window_name,
+        //     window_name,
+        //     limit,
+        //     offset
+        // );
+
+        // Log the inlined SQL query
+        // info!("Executing SQL query: {}", inlined_sql);
 
         sqlx::query_as(&sql)
             .bind(query)

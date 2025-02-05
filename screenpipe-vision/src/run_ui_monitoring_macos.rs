@@ -175,7 +175,8 @@ pub async fn run_ui() -> Result<()> {
                     if line.to_lowercase().contains("error") {
                         error!("ui_monitor stdout: {}", line);
                     } else {
-                        debug!("ui_monitor stdout: {}", line);
+                        // debug!("ui_monitor stdout: {}", line);
+                        error!("ui_monitor stdout: {}", line);
                     }
                 }
             });

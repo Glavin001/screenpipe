@@ -289,6 +289,7 @@ func setupDatabase() {
         if sqlite3_exec(screenPipeDb?.db, createTableSQL, nil, nil, nil) != SQLITE_OK {
             let error = String(cString: sqlite3_errmsg(screenPipeDb?.db))
             print("error creating table: \(error)")
+            print("sql: \(createTableSQL)")
             return
         }
 
@@ -1067,6 +1068,17 @@ func getElementPath(_ element: AXUIElement) -> (path: String, depth: Int) {
 }
 
 func buildTextOutput(from windowState: WindowState) -> String {
+    // return buildJsonOutput(from: windowState)
+    let jsonOutput = buildJsonOutput(from: windowState)
+    print("json output length: \(jsonOutput.count)")
+    let maxLength = 50000
+    if jsonOutput.count > maxLength {
+        return String(jsonOutput.prefix(maxLength))
+    }
+    return jsonOutput
+}
+
+func buildTextOutputOld(from windowState: WindowState) -> String {
     var textOutput = ""
     var processedElements = Set<String>()
     var seenTexts = Set<String>()  // Track unique text values
@@ -1163,15 +1175,149 @@ func buildTextOutput(from windowState: WindowState) -> String {
     return textOutput
 }
 
+// // Helper function to convert an ElementAttributes instance into a Dictionary
+// func elementAttributesToDict(_ element: ElementAttributes) -> [String: Any] {
+//     // Convert the timestamp to an ISO8601 string
+//     let timestampString = ISO8601DateFormatter().string(from: element.timestamp)
+    
+//     // Build the dictionary for the current element
+//     var dict: [String: Any] = [
+//         "element": element.element,
+//         "path": element.path,
+//         "attributes": element.attributes,
+//         "depth": element.depth,
+//         "frame": [
+//             "x": element.x,
+//             "y": element.y,
+//             "width": element.width,
+//             "height": element.height
+//         ],
+//         "timestamp": timestampString
+//     ]
+    
+//     // Recursively convert any children
+//     if !element.children.isEmpty {
+//         dict["children"] = element.children.map { elementAttributesToDict($0) }
+//     } else {
+//         dict["children"] = []
+//     }
+    
+//     return dict
+// }
+
+// // New method to build JSON output from the window state
+// func buildJsonOutput(from windowState: WindowState) -> String {
+//     print("building json output")
+
+//     // Convert the window state's timestamp to an ISO8601 string
+//     let stateTimestamp = ISO8601DateFormatter().string(from: windowState.timestamp)
+    
+//     // Build a dictionary representing the window state
+//     var stateDict: [String: Any] = [
+//         "timestamp": stateTimestamp,
+//         "textOutput": windowState.textOutput
+//     ]
+    
+//     // Convert the elements dictionary into a dictionary of element dictionaries.
+//     // The keys are the element identifiers.
+//     var elementsDict = [String: Any]()
+//     for (identifier, element) in windowState.elements {
+//         elementsDict[identifier] = elementAttributesToDict(element)
+//     }
+//     stateDict["elements"] = elementsDict
+    
+//     // Serialize the dictionary to JSON
+//     if let jsonData = try? JSONSerialization.data(withJSONObject: stateDict, options: []),
+//        let jsonString = String(data: jsonData, encoding: .utf8) {
+//         print("serialized json")
+//         return jsonString
+//     } else {
+//         print("failed to serialize json")
+//         return "{}"  // Return an empty JSON object if serialization fails
+//     }
+// }
+
+// Helper function to convert an ElementAttributes instance into a compact Dictionary.
+// The parent's portion of the path is removed by taking only the last segment.
+func elementToCompactDict(_ element: ElementAttributes) -> [String: Any] {
+    // Convert the element's timestamp to an ISO8601 string.
+    let elementTS = ISO8601DateFormatter().string(from: element.timestamp)
+    
+    // Compute the relative path as just the last segment.
+    let fullComponents = element.path.components(separatedBy: " -> ")
+    let relativePath = fullComponents.last ?? element.path
+    
+    // Build the compact dictionary using shorthand keys.
+    var dict: [String: Any] = [
+        "e": element.element,                           // element type (role)
+        "p": relativePath,                              // relative path (new part only)
+        "d": element.depth,                             // depth
+        "f": [
+            "x": element.x,                             // frame: x
+            "y": element.y,                             // frame: y
+            "w": element.width,                         // frame: width → w
+            "h": element.height                         // frame: height → h
+        ],
+        "a": element.attributes,                        // attributes
+        "ts": elementTS                                 // element timestamp
+    ]
+    
+    // Process children recursively.
+    if !element.children.isEmpty {
+        dict["c"] = element.children.map { elementToCompactDict($0) }
+    } else {
+        dict["c"] = [Any]() // empty array
+    }
+    
+    return dict
+}
+
+// New method to build compact JSON output from a window state.
+func buildJsonOutput(from windowState: WindowState) -> String {
+    // Convert the window state's timestamp to an ISO8601 string.
+    let stateTS = ISO8601DateFormatter().string(from: windowState.timestamp)
+    
+    // Identify the root elements (those with depth 0) and sort them.
+    let rootElements = windowState.elements.values.filter { $0.depth == 0 }
+    let sortedRoots = rootElements.sorted { (e1, e2) -> Bool in
+        if abs(e1.y - e2.y) < 10 {
+            return e1.x < e2.x
+        }
+        return e1.y < e2.y
+    }
+    
+    // Map the root elements into their compact dictionary representations.
+    let elementsArray = sortedRoots.map { elementToCompactDict($0) }
+    
+    // Build the final state dictionary using shorthand keys.
+    let stateDict: [String: Any] = [
+        "t": windowState.textOutput,  // text output
+        "ts": stateTS,                // timestamp
+        "e": elementsArray            // elements (array)
+    ]
+    
+    // Serialize the dictionary into JSON.
+    if let jsonData = try? JSONSerialization.data(withJSONObject: stateDict, options: []),
+       let jsonString = String(data: jsonData, encoding: .utf8) {
+        return jsonString
+    } else {
+        return "{}" // Return an empty JSON object if serialization fails.
+    }
+}
+
+
 func saveToDatabase(windowId: WindowIdentifier, newTextOutput: String, timestamp: String) {
     guard let db = screenPipeDb?.db else {
-        print("database not initialized")
+        print("error: database not initialized")
         return
     }
 
     let startTime = DispatchTime.now()
     let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
     let MAX_CHARS = 300_000
+
+    // Add logging for input parameters length
+    print("saving to db - app: \(windowId.app) (\(windowId.app.count) chars), window: \(windowId.window) (\(windowId.window.count) chars), text: \(newTextOutput.count) chars")
 
     // Sanitize window name by removing invisible characters
     let sanitizedWindow = windowId.window
@@ -1180,6 +1326,9 @@ func saveToDatabase(windowId: WindowIdentifier, newTextOutput: String, timestamp
     let sanitizedApp = windowId.app
         .components(separatedBy: CharacterSet.controlCharacters).joined()
         .trimmingCharacters(in: .whitespacesAndNewlines)
+
+    // Add logging for sanitized values
+    print("sanitized values - app: \(sanitizedApp) (\(sanitizedApp.count) chars), window: \(sanitizedWindow) (\(sanitizedWindow.count) chars)")
 
     let uiFrame = UIFrame(
         window: windowId.window,
@@ -1302,10 +1451,17 @@ func saveToDatabase(windowId: WindowIdentifier, newTextOutput: String, timestamp
             sqlite3_bind_text(updateStmt, 3, sanitizedApp, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(updateStmt, 4, sanitizedWindow, -1, SQLITE_TRANSIENT)
 
-            if sqlite3_step(updateStmt) != SQLITE_DONE {
-                print("error updating row")
+            let result = sqlite3_step(updateStmt)
+            if result != SQLITE_DONE {
+                let errorMsg = String(cString: sqlite3_errmsg(db))
+                print("error updating row: \(errorMsg) (code: \(result))")
+                print("sql: \(updateSQL)")
+                print("params: timestamp=\(timestamp), app=\(sanitizedApp), window=\(sanitizedWindow), text_length=\(finalText.count)")
             }
             sqlite3_finalize(updateStmt)
+        } else {
+            let errorMsg = String(cString: sqlite3_errmsg(db))
+            print("error preparing update statement: \(errorMsg)")
         }
     } else {
         let insertSQL = """
@@ -1322,10 +1478,17 @@ func saveToDatabase(windowId: WindowIdentifier, newTextOutput: String, timestamp
             sqlite3_bind_text(insertStmt, 4, sanitizedWindow, -1, SQLITE_TRANSIENT)
             sqlite3_bind_text(insertStmt, 5, finalText, -1, SQLITE_TRANSIENT)
 
-            if sqlite3_step(insertStmt) != SQLITE_DONE {
-                print("error inserting row")
+            let result = sqlite3_step(insertStmt)
+            if result != SQLITE_DONE {
+                let errorMsg = String(cString: sqlite3_errmsg(db))
+                print("error inserting row: \(errorMsg) (code: \(result))")
+                print("sql: \(insertSQL)")
+                print("params: timestamp=\(timestamp), app=\(sanitizedApp), window=\(sanitizedWindow), text_length=\(finalText.count)")
             }
             sqlite3_finalize(insertStmt)
+        } else {
+            let errorMsg = String(cString: sqlite3_errmsg(db))
+            print("error preparing insert statement: \(errorMsg)")
         }
     }
 
@@ -1353,6 +1516,7 @@ func saveElementValues() {
 
         // Build text output
         let textOutput = buildTextOutput(from: windowState)
+
         totalChars += textOutput.count
 
         // Store the formatted text output in the window state
