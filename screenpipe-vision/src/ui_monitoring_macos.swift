@@ -225,9 +225,15 @@ func startMonitoring() {
         exit(1)
     }
 
-    // Set up signal handling
+    // Register both SIGINT and SIGTERM handlers
     signal(SIGINT) { _ in
         print("received SIGINT, cleaning up...")
+        cleanup()
+        exit(0)
+    }
+
+    signal(SIGTERM) { _ in
+        print("received SIGTERM, cleaning up...")
         cleanup()
         exit(0)
     }
@@ -393,9 +399,9 @@ func monitorCurrentFrontmostApplication() {
 
     // Check if we already have recent data for this window
     let windowExists = globalElementValues[appName]?[windowName] != nil
-    let isWindowRecent =
-        globalElementValues[appName]?[windowName]?.timestamp.timeIntervalSinceNow ?? -Double
-        .infinity > -300  // 5 minutes
+    let timeSinceLastUpdate = globalElementValues[appName]?[windowName]?.timestamp.timeIntervalSinceNow ?? -Double.infinity
+    let windowTimeoutSeconds = 30.0 // 300.0
+    let isWindowRecent = timeSinceLastUpdate > -windowTimeoutSeconds
 
     // Initialize app and window in the structure if needed
     if globalElementValues[appName] == nil {
@@ -473,7 +479,29 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
             "html content",
         ]
         let attributesToCheck = [
-            "AXDescription", "AXValue", "AXLabel", "AXRoleDescription", "AXHelp",
+            "AXRole",
+            "AXRoleDescription", 
+            "AXValue",
+            "AXLabel",
+            "AXTitle",
+            "AXDescription",
+            "AXHelp",
+            "AXSelected",
+            "AXEnabled",
+            "AXFocused",
+            // "AXParent",
+            // "AXChildren",
+            // "AXPosition",
+            // "AXSize",
+            // "AXWindow",
+            // "AXTopLevelUIElement",
+            "AXSubrole",
+            // "AXFrame",
+            // "AXIdentifier",
+            // "AXAutomationTag",
+            // "AXRowIndexRange",
+            // "AXColumnIndexRange",
+            // "AXKeyboardFocused"
         ]
 
         // Add character count tracking
@@ -1071,7 +1099,7 @@ func buildTextOutput(from windowState: WindowState) -> String {
     // return buildJsonOutput(from: windowState)
     let jsonOutput = buildJsonOutput(from: windowState)
     print("json output length: \(jsonOutput.count)")
-    let maxLength = 50000
+    let maxLength = 200_000
     if jsonOutput.count > maxLength {
         return String(jsonOutput.prefix(maxLength))
     }
@@ -1241,7 +1269,7 @@ func buildTextOutputOld(from windowState: WindowState) -> String {
 // The parent's portion of the path is removed by taking only the last segment.
 func elementToCompactDict(_ element: ElementAttributes) -> [String: Any] {
     // Convert the element's timestamp to an ISO8601 string.
-    let elementTS = ISO8601DateFormatter().string(from: element.timestamp)
+    // let elementTS = ISO8601DateFormatter().string(from: element.timestamp)
     
     // Compute the relative path as just the last segment.
     let fullComponents = element.path.components(separatedBy: " -> ")
@@ -1252,23 +1280,29 @@ func elementToCompactDict(_ element: ElementAttributes) -> [String: Any] {
         "e": element.element,                           // element type (role)
         "p": relativePath,                              // relative path (new part only)
         "d": element.depth,                             // depth
-        "f": [
-            "x": element.x,                             // frame: x
-            "y": element.y,                             // frame: y
-            "w": element.width,                         // frame: width → w
-            "h": element.height                         // frame: height → h
-        ],
-        "a": element.attributes,                        // attributes
-        "ts": elementTS                                 // element timestamp
+        // "ts": elementTS                              // element timestamp
+        // "f": [
+        //     "x": element.x,                             // frame: x
+        //     "y": element.y,                             // frame: y
+        //     "w": element.width,                         // frame: width → w
+        //     "h": element.height                         // frame: height → h
+        // ],
+        "f": [element.x, element.y, element.width, element.height],  // frame: [x, y, width, height]
     ]
+    
+    // Only add attributes if not empty
+    if !element.attributes.isEmpty {
+        dict["a"] = element.attributes                  // attributes
+    }
     
     // Process children recursively.
     if !element.children.isEmpty {
         dict["c"] = element.children.map { elementToCompactDict($0) }
-    } else {
-        dict["c"] = [Any]() // empty array
     }
-    
+    // else {
+    //     dict["c"] = [Any]() // empty array
+    // }
+
     return dict
 }
 
@@ -1291,7 +1325,7 @@ func buildJsonOutput(from windowState: WindowState) -> String {
     
     // Build the final state dictionary using shorthand keys.
     let stateDict: [String: Any] = [
-        "t": windowState.textOutput,  // text output
+        // "t": windowState.textOutput,  // text output
         "ts": stateTS,                // timestamp
         "e": elementsArray            // elements (array)
     ]
@@ -1564,6 +1598,11 @@ func cleanup() {
     // Clear global state
     globalElementValues.removeAll()
     currentContext = nil
+    
+    // Stop the run loop if set
+    if let runLoop = monitoringEventLoop {
+        CFRunLoopStop(runLoop)
+    }
 }
 
 func pruneGlobalState() {
