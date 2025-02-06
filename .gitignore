@@ -5,6 +5,8 @@
 *.dylib
 *.so
 
+screenpipe-vision/bin/*/Contents/*
+
 # Test binary, built with `cargo test`
 *.test
 

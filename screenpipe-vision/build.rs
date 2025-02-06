@@ -21,29 +21,41 @@ fn main() {
 
         println!("cargo:rerun-if-changed=src/ui_monitoring_macos.swift");
 
-        let status = Command::new("swiftc")
-            .args([
+        // Check the build profile
+        let profile = env::var("PROFILE").unwrap();
+        let is_release = profile == "release";
+
+        println!("profile: {}", profile);
+        println!("is_release: {}", is_release);
+
+        // Set compiler flags based on the build profile
+        let mut args = vec![
+            "-num-threads", "8",
+            "-target",
+            if cfg!(target_arch = "aarch64") {
+                "arm64-apple-macos11.0"
+            } else {
+                "x86_64-apple-macos11.0"
+            },
+            "-o", binary_path.to_str().unwrap(),
+            "src/ui_monitoring_macos.swift",
+            "-framework", "Cocoa",
+            "-framework", "ApplicationServices",
+            "-framework", "Foundation",
+        ];
+
+        if is_release {
+            args.extend_from_slice(&[
                 "-O",
                 "-whole-module-optimization",
                 "-enforce-exclusivity=unchecked",
-                "-num-threads",
-                "8",
-                "-target",
-                if cfg!(target_arch = "aarch64") {
-                    "arm64-apple-macos11.0"
-                } else {
-                    "x86_64-apple-macos11.0"
-                },
-                "-o",
-                binary_path.to_str().unwrap(),
-                "src/ui_monitoring_macos.swift",
-                "-framework",
-                "Cocoa",
-                "-framework",
-                "ApplicationServices",
-                "-framework",
-                "Foundation",
-            ])
+            ]);
+        } else {
+            args.push("-g"); // Add debug symbols for non-release builds
+        }
+
+        let status = Command::new("swiftc")
+            .args(&args)
             .status()
             .expect("failed to compile Swift executable");
 
@@ -51,7 +63,6 @@ fn main() {
             panic!("failed to compile ui_monitor executable");
         }
 
-        let bin_path = PathBuf::from(&manifest_dir).join("bin");
         let new_path = bin_path.join("ui_monitor");
         std::fs::copy(&binary_path, &new_path).expect("failed to copy ui_monitor executable");
     }

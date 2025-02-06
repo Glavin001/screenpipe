@@ -7,6 +7,9 @@ import SQLite3
 setbuf(__stdoutp, nil)
 print("swift script starting...")
 
+// Constants
+let NO_PIPE_ARG = "NO_PIPE"
+
 // Add early error handling
 func checkAccessibilityPermissions() -> Bool {
     let checkOptPrompt = kAXTrustedCheckOptionPrompt.takeUnretainedValue()
@@ -216,6 +219,41 @@ func loadOrCreateState() -> UIMonitoringState {
     return defaultState
 }
 
+// Add global variable for pipe state
+var isPipeEnabled = true
+var handle: Int32 = -1
+
+func writeToPipe(uiFrame: UIFrame) throws {
+    guard isPipeEnabled else {
+        print("pipe disabled, skipping write")
+        return
+    }
+
+    // let bytesWritten = message.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
+    //     write(handle, buffer.baseAddress, message.count)
+    // }
+    // if bytesWritten == -1 {
+    //     perror("error writing to pipe")
+    // }
+
+    let message = uiFrame.toBytes()
+    var totalWritten = 0
+    while totalWritten < message.count {
+        let bytesWritten = message.withUnsafeBytes { buffer in
+            write(
+                handle,
+                buffer.baseAddress?.advanced(by: totalWritten),
+                message.count - totalWritten)
+        }
+        guard bytesWritten != -1 else {
+            throw NSError(
+                domain: "pipe error", code: 3,
+                userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
+        }
+        totalWritten += bytesWritten
+    }
+}
+
 func startMonitoring() {
     print("entering startMonitoring()")
 
@@ -242,16 +280,21 @@ func startMonitoring() {
     let args = CommandLine.arguments
     let namedPipePath = args[1]
 
-    if namedPipePath.isEmpty {
-        print("error: named pipe path is empty")
-        exit(1)
-    }
+    if namedPipePath == NO_PIPE_ARG {
+        print("pipe has been disabled")
+        isPipeEnabled = false
+    } else {
+        if namedPipePath.isEmpty {
+            print("error: named pipe path is empty")
+            exit(1)
+        }
 
-    // create handle
-    let handle = open(namedPipePath, O_WRONLY)
-    if handle == -1 {
-        print("error: failed to open named pipe")
-        exit(1)
+        // create handle
+        handle = open(namedPipePath, O_WRONLY)
+        if handle == -1 {
+            print("error: failed to open named pipe")
+            exit(1)
+        }
     }
 
     setupDatabase()
@@ -524,7 +567,7 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
             // Check for cancellation or character limit
             if shouldCancelTraversal || totalCharacterCount >= 100_000 {
                 if totalCharacterCount >= 1_000_000 {
-                    print("hit 1mln char limit for app: \(appName), window: \(windowName)")
+                    print("error: hit 1mln char limit for app: \(appName), window: \(windowName)")
                 }
                 return nil
             }
@@ -582,20 +625,43 @@ func traverseAndStoreUIElements(_ element: AXUIElement, appName: String, windowN
 
             var hasRelevantValue = false
 
-            for attr in attributes {
-                // Check relevant attributes
-                if attributesToCheck.contains(attr) {
-                    if let value = getAttributeValue(element, forAttribute: attr) {
+            switch elementDesc {
+                case "AXToolbar", "AXSplitter", "AXSplitGroup", "AXScrollArea":
+                    // Skip processing attributes for container elements but continue traversal
+                    hasRelevantValue = false
+                case "AXStaticText":
+                    if let value = getAttributeValue(element, forAttribute: "AXValue") {
                         let valueStr = describeValue(value)
-                        if !valueStr.isEmpty && !unwantedValues.contains(valueStr)
-                            && valueStr.count > 1 && !unwantedLabels.contains(valueStr.lowercased())
-                        {
-                            // Store attribute and its value
-                            elementAttributes.attributes[attr] = valueStr
+                        if !valueStr.isEmpty {
+                            elementAttributes.attributes["AXValue"] = valueStr
                             hasRelevantValue = true
                         }
                     }
-                }
+                default:
+                    for attr in attributes {
+                        // Check relevant attributes
+                        if attributesToCheck.contains(attr) {
+                            if let value = getAttributeValue(element, forAttribute: attr) {
+                                let valueStr = describeValue(value)
+                                // if !valueStr.isEmpty && !unwantedValues.contains(valueStr)
+                                //     && valueStr.count > 1 && !unwantedLabels.contains(valueStr.lowercased())
+                                if !valueStr.isEmpty
+                                {
+                                    // Store attribute and its value
+                                    switch attr {
+                                        case "AXEnabled", "AXFocused":
+                                            if valueStr == "1" {
+                                                elementAttributes.attributes[attr] = "1"
+                                                hasRelevantValue = true
+                                            }
+                                        default:
+                                            elementAttributes.attributes[attr] = valueStr
+                                            hasRelevantValue = true
+                                    }
+                                }
+                            }
+                        }
+                    }
             }
 
             // Traverse child elements
@@ -790,6 +856,8 @@ func handleFocusedWindowChange(element: AXUIElement) {
 
     // Get the new window name
     var windowName = "unknown window"
+    // FIXME: I think there is a bug related to using the window name as a key under app.
+    // Some apps change the window name often (e.g. Finger) and then appears to orphan the changed elements within the unchanged container.
     if let titleValue = getAttributeValue(element, forAttribute: kAXTitleAttribute) as? String {
         windowName = titleValue.lowercased()
             .components(separatedBy: CharacterSet.controlCharacters).joined()
@@ -1305,11 +1373,12 @@ func elementToCompactDict(_ element: ElementAttributes) -> [String: Any] {
 
     return dict
 }
-
 // New method to build compact JSON output from a window state.
 func buildJsonOutput(from windowState: WindowState) -> String {
     // Convert the window state's timestamp to an ISO8601 string.
     let stateTS = ISO8601DateFormatter().string(from: windowState.timestamp)
+    
+    var processedElements = Set<String>()
     
     // Identify the root elements (those with depth 0) and sort them.
     let rootElements = windowState.elements.values.filter { $0.depth == 0 }
@@ -1321,13 +1390,29 @@ func buildJsonOutput(from windowState: WindowState) -> String {
     }
     
     // Map the root elements into their compact dictionary representations.
-    let elementsArray = sortedRoots.map { elementToCompactDict($0) }
+    let elementsArray = sortedRoots.map { element -> [String: Any] in
+        processedElements.insert(element.identifier)
+        return elementToCompactDict(element)
+    }
+    
+    // Handle orphaned elements
+    let orphanElements = windowState.elements.filter { !processedElements.contains($0.key) }
+    let sortedOrphans = orphanElements.values.sorted { (e1, e2) -> Bool in
+        if e1.timestamp == e2.timestamp {
+            if abs(e1.y - e2.y) < 10 {
+                return e1.x < e2.x
+            }
+            return e1.y < e2.y
+        }
+        return e1.timestamp < e2.timestamp
+    }
     
     // Build the final state dictionary using shorthand keys.
     let stateDict: [String: Any] = [
         // "t": windowState.textOutput,  // text output
         "ts": stateTS,                // timestamp
-        "e": elementsArray            // elements (array)
+        "e": elementsArray,           // root elements array
+        // "o": sortedOrphans.map { elementToCompactDict($0) } // orphaned elements array
     ]
     
     // Serialize the dictionary into JSON.
@@ -1335,6 +1420,7 @@ func buildJsonOutput(from windowState: WindowState) -> String {
        let jsonString = String(data: jsonData, encoding: .utf8) {
         return jsonString
     } else {
+        print("error: failed to serialize json")
         return "{}" // Return an empty JSON object if serialization fails.
     }
 }
@@ -1795,32 +1881,6 @@ class ScreenPipeDB {
     }
 }
 
-func writeToPipe(uiFrame: UIFrame) throws {
-    let message = uiFrame.toBytes()
-    // let bytesWritten = message.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) in
-    //     write(handle, buffer.baseAddress, message.count)
-    // }
-    // if bytesWritten == -1 {
-    //     perror("error writing to pipe")
-    // }
-
-    var totalWritten = 0
-    while totalWritten < message.count {
-        let bytesWritten = message.withUnsafeBytes { buffer in
-            write(
-                handle,
-                buffer.baseAddress?.advanced(by: totalWritten),
-                message.count - totalWritten)
-        }
-        guard bytesWritten != -1 else {
-            throw NSError(
-                domain: "pipe error", code: 3,
-                userInfo: [NSLocalizedDescriptionKey: String(cString: strerror(errno))])
-        }
-        totalWritten += bytesWritten
-    }
-}
-
 guard CommandLine.arguments.count > 1 else {
     print("error: named pipe path not provided")
     exit(1)
@@ -1828,17 +1888,22 @@ guard CommandLine.arguments.count > 1 else {
 
 let namedPipePath = CommandLine.arguments[1]
 
-// Check if the path is valid and is a named pipe
-var statInfo = stat()
-if stat(namedPipePath, &statInfo) != 0 || (statInfo.st_mode & S_IFMT) != S_IFIFO {
-    print("error: invalid named pipe path or not a named pipe")
-    exit(1)
-}
+if namedPipePath == NO_PIPE_ARG {
+    print("pipe has been disabled")
+    isPipeEnabled = false
+} else {
+    // Check if the path is valid and is a named pipe
+    var statInfo = stat()
+    if stat(namedPipePath, &statInfo) != 0 || (statInfo.st_mode & S_IFMT) != S_IFIFO {
+        print("error: invalid named pipe path or not a named pipe")
+        exit(1)
+    }
 
-let handle = open(namedPipePath, O_WRONLY)
-if handle == -1 {
-    perror("error: failed to open named pipe")
-    exit(1)
+    handle = open(namedPipePath, O_WRONLY)
+    if handle == -1 {
+        perror("error: failed to open named pipe")
+        exit(1)
+    }
 }
 
 startMonitoring()

@@ -64,6 +64,8 @@ pub async fn run_ui() -> Result<()> {
     let is_running = Arc::new(AtomicBool::new(true));
     let is_running_clone = is_running.clone();
     let (is_running_sender, mut is_running_receiver) = tokio::sync::broadcast::channel(1);
+    let mut is_running_receiver_main = is_running_sender.subscribe();
+
     tokio::spawn(async move {
         let mut terminate_signal =
             signal::unix::signal(signal::unix::SignalKind::terminate()).unwrap();
@@ -159,6 +161,7 @@ pub async fn run_ui() -> Result<()> {
             .arg(named_pipe_clone.path.clone())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .expect("failed to start ui_monitor");
 
@@ -176,7 +179,7 @@ pub async fn run_ui() -> Result<()> {
                         error!("ui_monitor stdout: {}", line);
                     } else {
                         // debug!("ui_monitor stdout: {}", line);
-                        error!("ui_monitor stdout: {}", line);
+                        warn!("ui_monitor stdout: {}", line);
                     }
                 }
             });
@@ -194,17 +197,25 @@ pub async fn run_ui() -> Result<()> {
             });
         }
 
-        // Wait for the process to exit
-        match child.wait().await {
-            Ok(status) => {
-                warn!("ui_monitor exited with status: {}", status);
-                warn!("restarting ui_monitor in 5 seconds...");
-                sleep(Duration::from_secs(5)).await;
+        let child_wait = child.wait();
+        tokio::select! {
+            status = child_wait => {
+                match status {
+                    Ok(status) => {
+                        warn!("ui_monitor exited with status: {}", status);
+                        warn!("restarting ui_monitor in 5 seconds...");
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                    Err(e) => {
+                        error!("failed to wait for ui_monitor process: {}", e);
+                        warn!("retrying ui_monitor in 5 seconds...");
+                        sleep(Duration::from_secs(5)).await;
+                    }
+                }
             }
-            Err(e) => {
-                error!("failed to wait for ui_monitor process: {}", e);
-                warn!("retrying ui_monitor in 5 seconds...");
-                sleep(Duration::from_secs(5)).await;
+            _ = is_running_receiver_main.recv() => {
+                let _ = child.kill().await;
+                break;
             }
         }
     }
